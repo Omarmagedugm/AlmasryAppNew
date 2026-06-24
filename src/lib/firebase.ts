@@ -1,0 +1,303 @@
+import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { initializeFirestore, doc, getDocFromServer, persistentLocalCache, persistentMultipleTabManager, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { getMessaging, getToken, onMessage, isSupported } from 'firebase/messaging';
+import { getDatabase } from 'firebase/database';
+
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+  UPLOAD = 'upload',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+export function handleFirestoreError(error: any, operationType: OperationType, path: string | null) {
+  const errCode = error?.code || '';
+  const errStr = error?.message || errCode || String(error);
+  
+  const auth = getAuth();
+  const errInfo: FirestoreErrorInfo = {
+    error: errStr,
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+
+  const isRead = operationType === OperationType.LIST || operationType === OperationType.GET;
+  const isUnavailable = errCode === 'unavailable' || errCode === 'deadline-exceeded' || errStr.includes('offline');
+  const isQuotaExceeded = errCode === 'resource-exhausted' || errStr.toLowerCase().includes('quota');
+
+  if (isRead && (isUnavailable || isQuotaExceeded)) {
+    console.warn(`Firestore [${path}] temporarily unavailable. Operating in offline/quota-exceeded mode.`, errInfo);
+    return;
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('firestore-error', { 
+      detail: { code: errCode, message: errStr, path, operationType } 
+    }));
+  }
+
+  console.error(`Firestore Error [${path}]: `, JSON.stringify(errInfo));
+  if (isQuotaExceeded) {
+     console.warn("Quota Exceeded. Application degraded.");
+  }
+
+  // If this is a write/mutation operation (not a read), throw the error so that callers 
+  // (like form submit handlers) are aware of the write failure and can react accordingly.
+  if (!isRead) {
+    throw new Error(errStr);
+  }
+}
+
+export function handleStorageError(error: any, path: string) {
+  const errInfo = {
+    error: error?.message || error?.code || String(error),
+    authInfo: {
+      userId: getAuth().currentUser?.uid,
+    },
+    operationType: 'UPLOAD',
+    path
+  };
+  console.error(`Storage Error [${path}]: `, JSON.stringify(errInfo));
+  throw new Error(`STORAGE_ERROR: ${errInfo.error}`);
+}
+
+const genLangConfig = {
+  apiKey: "AIzaSyAjn3P2UUYwSiPtCP-UQUQ-rm5c9y4ymFU",
+  authDomain: "gen-lang-client-0026252792.firebaseapp.com",
+  databaseURL: "https://gen-lang-client-0026252792-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "gen-lang-client-0026252792",
+  storageBucket: "gen-lang-client-0026252792.firebasestorage.app",
+  messagingSenderId: "430937320759",
+  appId: "1:430937320759:web:3c99a7f3cdec3db9477eb2",
+  measurementId: "G-XWSSXYDQN1",
+  firestoreDatabaseId: "ai-studio-357e06d6-fd86-4f0e-8acb-76bb22941942"
+};
+
+const getEnvVar = (key: string, fallback: string): string => {
+  const value = import.meta.env[key];
+  if (!value || typeof value !== 'string' || value === 'undefined' || value === 'null' || value.trim() === '') {
+    return fallback;
+  }
+  return value.trim();
+};
+
+const getEnvVarOptional = (key: string): string | undefined => {
+  const value = import.meta.env[key];
+  if (!value || typeof value !== 'string' || value === 'undefined' || value === 'null' || value.trim() === '') {
+    return undefined;
+  }
+  return value.trim();
+};
+
+const authDomainEnv = getEnvVarOptional('VITE_FIREBASE_AUTH_DOMAIN');
+const apiKeyEnv = getEnvVarOptional('VITE_FIREBASE_API_KEY');
+const projectIdEnv = getEnvVarOptional('VITE_FIREBASE_PROJECT_ID');
+
+// Check hostname to determine environment in browser contexts
+const getHostname = (): string => {
+  if (typeof window !== 'undefined' && window.location) {
+    return window.location.hostname;
+  }
+  return '';
+};
+
+const hostname = getHostname();
+const isSandboxEnv = hostname.includes('europe-west2.run.app') || 
+                     hostname.includes('gen-lang') || 
+                     hostname.includes('localhost') || 
+                     hostname.includes('127.0.0.1');
+
+// Use completely dynamic environment variables if they are provided,
+// otherwise fall back to either custom project (if requested or in prod) or sandbox config.
+const hasEnvConfig = !!apiKeyEnv && !!projectIdEnv;
+
+// In the AI Studio preview environment, we support toggling between the sandbox preview database
+// and the custom production database (masrytv-be1be) where the user's real members/data are.
+// We default to the custom production database if configured via environment variables.
+const getDbChoice = (): 'production' | 'sandbox' | null => {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    const choice = window.localStorage.getItem('firebase_db_choice');
+    if (choice === 'production' || choice === 'sandbox') {
+      return choice as 'production' | 'sandbox';
+    }
+  }
+  return null;
+};
+
+const dbChoice = getDbChoice();
+
+const isExplicitCustom = (authDomainEnv && authDomainEnv.includes('masrytv-be1be')) || 
+                         (apiKeyEnv && apiKeyEnv === 'AIzaSyCI6aRv9HmUmnBS2zJRtWBHcabT_6hcGI0') ||
+                         (projectIdEnv === 'masrytv-be1be');
+
+export const isUsingProductionDb = dbChoice === 'production' || 
+                                   (dbChoice !== 'sandbox' && !isSandboxEnv);
+
+let firebaseConfig;
+
+if (isUsingProductionDb) {
+  firebaseConfig = {
+    apiKey: "AIzaSyCI6aRv9HmUmnBS2zJRtWBHcabT_6hcGI0",
+    authDomain: "masrytv-be1be.firebaseapp.com",
+    databaseURL: "https://masrytv-be1be-default-rtdb.firebaseio.com",
+    projectId: "masrytv-be1be",
+    storageBucket: "masrytv-be1be.appspot.com",
+    messagingSenderId: "725960187583",
+    appId: "1:725960187583:web:da952e463a8be708e0da41",
+    measurementId: "G-W63RX2JFBJ",
+    firestoreDatabaseId: "(default)"
+  };
+} else {
+  firebaseConfig = genLangConfig;
+}
+
+const app = initializeApp(firebaseConfig);
+
+// Using initializeFirestore with persistent local cache and experimental settings to improve connectivity in restricted environments
+const firestoreDbId = firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
+  ? firebaseConfig.firestoreDatabaseId 
+  : undefined;
+
+export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager()
+  }),
+}, firestoreDbId);
+
+export const auth = getAuth(app);
+export const storage = getStorage(app);
+export const rtdb = getDatabase(app);
+
+let messagingInstance: any = null;
+
+const initializeMessaging = async () => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const supported = await isSupported();
+    if (supported) {
+      messagingInstance = getMessaging(app);
+      onMessage(messagingInstance, (payload) => {
+        const title = payload.notification?.title || 'إشعار جديد';
+        const body = payload.notification?.body || '';
+        const event = new CustomEvent('fcm-message', { detail: { title, body, payload } });
+        window.dispatchEvent(event);
+      });
+      return messagingInstance;
+    }
+  } catch (e) {
+    console.warn("Firebase Messaging initialization failed (expected in some environments):", e);
+  }
+  return null;
+};
+
+initializeMessaging();
+
+async function testConnection() {
+  try {
+    await getDoc(doc(db, 'test', 'connection'));
+    console.info('Firestore connection test initiated.');
+  } catch (error: any) {
+    const errStr = error?.message || '';
+    if (errStr.includes('offline') || error?.code === 'unavailable') {
+      console.warn("Firestore is currently in offline mode. It will sync automatically once a connection is established.");
+    } else {
+       console.error("Firestore connectivity issue:", error);
+    }
+  }
+}
+testConnection();
+
+export const messaging = messagingInstance;
+
+export const requestNotificationPermission = async () => {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  
+  const activeMessaging = messagingInstance || await initializeMessaging();
+  if (!activeMessaging) return;
+  
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      // Get service worker registration
+      let registration;
+      if ('serviceWorker' in navigator) {
+        registration = await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js');
+        if (!registration) {
+          registration = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
+            scope: '/'
+          });
+        }
+      }
+
+      const currentToken = await getToken(activeMessaging, { 
+        vapidKey: 'BLpfNtPFcOkDCoXJ0F_vmM3RmtPtWy24cGby0tw-XL2EeZz3xxa_2DXYjS8uw_dRSsZIrcq-05Rv68nTJbJgrzg',
+        serviceWorkerRegistration: registration 
+      });
+      
+      if (currentToken) {
+        console.log('FCM Token generated:', currentToken);
+        const user = getAuth().currentUser;
+        
+        // Save token with more metadata
+        await setDoc(doc(db, 'fcm_tokens', currentToken), {
+          token: currentToken,
+          userId: user ? user.uid : 'anonymous',
+          lastSeen: serverTimestamp(),
+          platform: navigator.platform,
+          userAgent: navigator.userAgent,
+          isPWA: window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone === true,
+          status: 'active'
+        }, { merge: true });
+
+        return currentToken;
+      }
+    }
+  } catch (err) {
+    console.warn('FCM Permission/Token error:', err);
+  }
+};
+
+export const uploadImage = async (file: File, folder: string): Promise<string> => {
+  const path = `${folder}/${Date.now()}_${file.name}`;
+  try {
+    const storageRef = ref(storage, path);
+    await uploadBytes(storageRef, file);
+    return await getDownloadURL(storageRef);
+  } catch (error) {
+    handleStorageError(error, path);
+    return '';
+  }
+};

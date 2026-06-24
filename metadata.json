@@ -1,0 +1,8 @@
+{
+  "name": "Remix: قناة المصري البورسعيدي22222",
+  "description": "التطبيق الرسمي لجماهير النادي المصري البورسعيدي - أخبار، مباريات، وبث مباشر",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
